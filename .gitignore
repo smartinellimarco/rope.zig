@@ -1,0 +1,6 @@
+target/
+.zig-cache/
+zig-pkg/
+zig-out/
+.DS_Store
+BACKLOG.md
