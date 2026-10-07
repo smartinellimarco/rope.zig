@@ -2,7 +2,7 @@
     .name = .rope,
     .version = "0.0.0",
     .fingerprint = 0xb11ed737c0874a1d,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",
