@@ -4,8 +4,8 @@ const fanout = 16;
 const chunk = 256;
 
 /// A rope over UTF-8 chunks. Positions are byte offsets and every node counts
-/// the bytes under it: edits land in logarithmic time no matter how far apart
-/// they are, and the text comes back out without re-encoding.
+/// the bytes and newlines under it: edits and line lookups land in logarithmic
+/// time, and the text comes back out without re-encoding.
 pub const Text = struct {
     gpa: std.mem.Allocator,
     // Chunks come from an arena and go away together.
@@ -30,7 +30,58 @@ pub const Text = struct {
     }
 
     pub fn len(self: Text) u32 {
-        return self.root.total();
+        return self.root.total().bytes;
+    }
+
+    pub fn lineCount(self: Text) u32 {
+        return self.root.total().lines + 1;
+    }
+
+    /// The line `pos` sits on: how many newlines come before it.
+    pub fn lineOf(self: *const Text, pos: u32) u32 {
+        var node = self.root;
+        var left = pos;
+        var line: u32 = 0;
+        while (node.level > 0) {
+            var child: u16 = 0;
+            while (child + 1 < node.len and left >= node.counts[child].bytes) : (child += 1) {
+                left -= node.counts[child].bytes;
+                line += node.counts[child].lines;
+            }
+            node = node.children[child];
+        }
+
+        const head = node.head();
+        if (left <= head.len) return line + newlines(head[0..left]);
+        return line + newlines(head) + newlines(node.tail()[0 .. left - head.len]);
+    }
+
+    /// Where `line` starts: right after the newline that ends the one before.
+    pub fn lineStart(self: *const Text, line: u32) u32 {
+        std.debug.assert(line < self.lineCount());
+        if (line == 0) return 0;
+
+        var node = self.root;
+        var left = line;
+        var base: u32 = 0;
+        while (node.level > 0) {
+            var child: u16 = 0;
+            while (left > node.counts[child].lines) : (child += 1) {
+                left -= node.counts[child].lines;
+                base += node.counts[child].bytes;
+            }
+            node = node.children[child];
+        }
+
+        for ([_][]u8{ node.head(), node.tail() }) |piece| {
+            for (piece, 0..) |byte, i| {
+                if (byte != '\n') continue;
+                left -= 1;
+                if (left == 0) return base + @as(u32, @intCast(i)) + 1;
+            }
+            base += @intCast(piece.len);
+        }
+        unreachable;
     }
 
     pub fn insert(self: *Text, pos: u32, text: []const u8) !void {
@@ -61,8 +112,10 @@ pub const Text = struct {
             @memcpy(leaf.text[leaf.gap_start..][0..take], rest[0..take]);
             leaf.gap_start += @intCast(take);
 
+            const added = newlines(rest[0..take]);
             leaf.bytes += @intCast(take);
-            self.fixCounts(leaf, take);
+            leaf.lines += @intCast(added);
+            self.fixCounts(leaf, take, added);
 
             offset += take;
             rest = rest[take..];
@@ -81,10 +134,12 @@ pub const Text = struct {
             const take: u32 = @intCast(@min(after.len, remaining));
 
             if (take > 0) {
+                const removed = newlines(after[0..take]);
                 leaf.gap_end += @intCast(take);
                 leaf.bytes -= @intCast(take);
+                leaf.lines -= @intCast(removed);
 
-                self.fixCounts(leaf, -@as(i64, take));
+                self.fixCounts(leaf, -@as(i64, take), -@as(i64, removed));
                 remaining -= take;
             }
 
@@ -97,7 +152,7 @@ pub const Text = struct {
     pub fn toBytes(self: Text, gpa: std.mem.Allocator) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
-        try out.ensureTotalCapacity(gpa, self.root.total());
+        try out.ensureTotalCapacity(gpa, self.root.total().bytes);
 
         var leaf: ?*Node = firstLeaf(self.root);
         while (leaf) |node| : (leaf = nextLeaf(node)) {
@@ -123,14 +178,14 @@ pub const Text = struct {
             var walk = leaf;
             var walk_base = self.cursor_leaf_pos;
             while (true) {
-                if (pos >= walk_base and pos - walk_base <= walk.total()) {
+                if (pos >= walk_base and pos - walk_base <= walk.total().bytes) {
                     node = walk;
                     base = walk_base;
                     break;
                 }
 
                 const parent = walk.parent orelse break;
-                for (parent.counts[0..walk.parent_idx]) |child| walk_base -= child;
+                for (parent.counts[0..walk.parent_idx]) |child| walk_base -= child.bytes;
                 walk = parent;
             }
         }
@@ -159,7 +214,7 @@ pub const Text = struct {
         var left = pos;
         while (node.level > 0) {
             var child: u16 = 0;
-            while (left >= node.counts[child]) : (child += 1) left -= node.counts[child];
+            while (left >= node.counts[child].bytes) : (child += 1) left -= node.counts[child].bytes;
             node = node.children[child];
         }
 
@@ -205,13 +260,12 @@ pub const Text = struct {
         return out.toOwnedSlice(gpa);
     }
 
-    fn fixCounts(self: *Text, leaf: *Node, bytes: i64) void {
+    fn fixCounts(self: *Text, leaf: *Node, bytes: i64, lines: i64) void {
         _ = self;
         var node = leaf;
         while (node.parent) |parent| {
-            const slot = &parent.counts[node.parent_idx];
-            slot.* = @intCast(@as(i64, slot.*) + bytes);
-            parent.subtree = @intCast(@as(i64, parent.subtree) + bytes);
+            parent.counts[node.parent_idx].shift(bytes, lines);
+            parent.subtree.shift(bytes, lines);
 
             node = parent;
         }
@@ -225,12 +279,15 @@ pub const Text = struct {
         const moved: u16 = @intCast(leaf.tail().len);
 
         @memcpy(sibling.text[0..moved], leaf.tail());
+        const moved_lines: u16 = @intCast(newlines(sibling.text[0..moved]));
         sibling.bytes = moved;
+        sibling.lines = moved_lines;
         sibling.gap_start = moved;
         sibling.gap_end = chunk;
 
         leaf.gap_end = chunk;
         leaf.bytes -= moved;
+        leaf.lines -= moved_lines;
 
         // Only this leaf's own entry moves: the text stayed in the subtree.
         if (leaf.parent) |parent| {
@@ -302,19 +359,35 @@ pub const Text = struct {
     }
 };
 
+const Counts = struct {
+    bytes: u32 = 0,
+    lines: u32 = 0,
+
+    fn add(self: *Counts, other: Counts) void {
+        self.bytes += other.bytes;
+        self.lines += other.lines;
+    }
+
+    fn shift(self: *Counts, bytes: i64, lines: i64) void {
+        self.bytes = @intCast(@as(i64, self.bytes) + bytes);
+        self.lines = @intCast(@as(i64, self.lines) + lines);
+    }
+};
+
 const Node = struct {
     parent: ?*Node = null,
     parent_idx: u16 = 0,
     level: u8,
     len: u16 = 0,
     bytes: u16 = 0,
+    lines: u16 = 0,
     // Free space inside the chunk, parked where the last edit landed so that
     // typing forwards never moves anything.
     gap_start: u16 = 0,
     gap_end: u16 = chunk,
-    counts: [fanout]u32 = @splat(0),
+    counts: [fanout]Counts = @splat(.{}),
     // What the whole subtree holds, so climbing out of a chunk costs nothing.
-    subtree: u32 = 0,
+    subtree: Counts = .{},
     text: [chunk]u8 = undefined,
     children: [fanout]*Node = undefined,
 
@@ -340,13 +413,13 @@ const Node = struct {
         return self.text[self.gap_end..];
     }
 
-    fn total(self: Node) u32 {
-        return if (self.level == 0) self.bytes else self.subtree;
+    fn total(self: Node) Counts {
+        return if (self.level == 0) .{ .bytes = self.bytes, .lines = self.lines } else self.subtree;
     }
 
     fn recount(self: *Node) void {
-        self.subtree = 0;
-        for (self.counts[0..self.len]) |child| self.subtree += child;
+        self.subtree = .{};
+        for (self.counts[0..self.len]) |child| self.subtree.add(child);
     }
 
     // Chunks never split a character, so the end of one is always a boundary.
@@ -356,6 +429,10 @@ const Node = struct {
         return self.text[at] & 0xc0 != 0x80;
     }
 };
+
+fn newlines(text: []const u8) u32 {
+    return @intCast(std.mem.count(u8, text, "\n"));
+}
 
 /// How many bytes of `text` fit in `room` without splitting a character.
 fn fitting(text: []const u8, room: u32) u32 {
@@ -372,8 +449,8 @@ fn descend(from: *Node, remaining: u32) struct { leaf: *Node, remaining: u32 } {
 
     while (node.level > 0) {
         var child: u16 = 0;
-        while (child + 1 < node.len and left > node.counts[child]) : (child += 1) {
-            left -= node.counts[child];
+        while (child + 1 < node.len and left > node.counts[child].bytes) : (child += 1) {
+            left -= node.counts[child].bytes;
         }
         node = node.children[child];
     }
@@ -402,13 +479,14 @@ fn newNode(gpa: std.mem.Allocator, level: u8) !*Node {
     return node;
 }
 
-fn checkNode(node: *Node) !u32 {
+fn checkNode(node: *Node) !Counts {
     if (node.level == 0) {
         try std.testing.expectEqual(@as(u32, node.bytes), @as(u32, @intCast(node.head().len + node.tail().len)));
-        return node.bytes;
+        try std.testing.expectEqual(@as(u32, node.lines), newlines(node.head()) + newlines(node.tail()));
+        return node.total();
     }
 
-    var sum: u32 = 0;
+    var sum: Counts = .{};
     try std.testing.expectEqual(node.subtree, node.total());
     for (node.children[0..node.len], 0..) |child, i| {
         try std.testing.expectEqual(@as(u16, @intCast(i)), child.parent_idx);
@@ -416,7 +494,7 @@ fn checkNode(node: *Node) !u32 {
 
         const actual = try checkNode(child);
         try std.testing.expectEqual(node.counts[i], actual);
-        sum += actual;
+        sum.add(actual);
     }
     return sum;
 }
@@ -612,7 +690,7 @@ fn cursorBase(leaf: *Node) u32 {
     var node = leaf;
     var base: u32 = 0;
     while (node.parent) |parent| {
-        for (parent.counts[0..node.parent_idx]) |child| base += child;
+        for (parent.counts[0..node.parent_idx]) |child| base += child.bytes;
         node = parent;
     }
     return base;
@@ -825,4 +903,61 @@ test "a chunk in the middle covers the byte asked for" {
     const piece = text.chunkAt(7);
     try testing.expect(piece.start <= 7 and 7 < piece.start + piece.bytes.len);
     try testing.expectEqual(@as(u8, 'w'), piece.bytes[7 - piece.start]);
+}
+
+test "lines are counted through every edit" {
+    const gpa = testing.allocator;
+
+    var text = try Text.init(gpa);
+    defer text.deinit();
+
+    var model: std.ArrayList(u8) = .empty;
+    defer model.deinit(gpa);
+
+    var prng: std.Random.DefaultPrng = .init(9);
+    const random = prng.random();
+
+    for (0..3000) |step| {
+        const length: u32 = @intCast(model.items.len);
+        const pos = if (length == 0) 0 else random.uintAtMost(u32, length);
+
+        if (length > 1500 and random.boolean()) {
+            const count = @min(random.uintAtMost(u32, 300) + 1, length - pos);
+            text.delete(pos, count);
+            model.replaceRangeAssumeCapacity(pos, count, &.{});
+        } else {
+            const word = ([_][]const u8{ "ab", "\n", "lorem\n", "\n\n", "ipsum " })[random.uintLessThan(usize, 5)];
+            try text.insert(pos, word);
+            try model.insertSlice(gpa, pos, word);
+        }
+
+        if (step % 100 != 0) continue;
+        _ = try checkNode(text.root);
+
+        try testing.expectEqual(newlines(model.items) + 1, text.lineCount());
+
+        var line: u32 = 0;
+        try testing.expectEqual(@as(u32, 0), text.lineStart(0));
+        for (model.items, 0..) |byte, at| {
+            try testing.expectEqual(line, text.lineOf(@intCast(at)));
+            if (byte == '\n') {
+                line += 1;
+                try testing.expectEqual(@as(u32, @intCast(at + 1)), text.lineStart(line));
+            }
+        }
+        try testing.expectEqual(line, text.lineOf(@intCast(model.items.len)));
+    }
+}
+
+test "line lookups on a short text" {
+    var text = try Text.init(testing.allocator);
+    defer text.deinit();
+    try text.insert(0, "abc\ndef\n");
+
+    try testing.expectEqual(@as(u32, 3), text.lineCount());
+    try testing.expectEqual(@as(u32, 0), text.lineOf(3));
+    try testing.expectEqual(@as(u32, 1), text.lineOf(4));
+    try testing.expectEqual(@as(u32, 2), text.lineOf(8));
+    try testing.expectEqual(@as(u32, 4), text.lineStart(1));
+    try testing.expectEqual(@as(u32, 8), text.lineStart(2));
 }
