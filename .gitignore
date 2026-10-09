@@ -1,6 +1,8 @@
-target/
+# Zig
 .zig-cache/
-zig-pkg/
 zig-out/
+zig-pkg/
+*.o
+
+# MacOS
 .DS_Store
-BACKLOG.md
