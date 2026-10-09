@@ -1,8 +1,8 @@
 # rope.zig
 
 A rope over utf-8 chunks. Positions are bytes, every node counts the bytes and
-newlines under it, and each chunk keeps a gap where the last edit landed so typing forwards
-moves nothing.
+newlines under it, and each chunk keeps a gap where the last edit landed so
+typing forwards moves nothing.
 
 ## Install
 
