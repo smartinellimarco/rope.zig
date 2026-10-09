@@ -32,10 +32,12 @@ defer gpa.free(all);
 
 const part = try text.slice(gpa, 6, 11);   // "there"
 defer gpa.free(part);
+
+const piece = text.chunkAt(7);   // the bytes around position 7, no copy
 ```
 
 Positions are byte offsets, so `delete(5, 6)` erases six bytes. Reading never
-moves a gap: `slice` takes a const pointer and leaves the chunk the last edit
+moves a gap: `slice` and `chunkAt` take a const pointer and leaves the chunk the last edit
 touched where it was.
 
 ## Test

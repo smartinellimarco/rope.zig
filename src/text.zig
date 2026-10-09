@@ -144,6 +144,30 @@ pub const Text = struct {
         return .{ .leaf = walked.leaf, .offset = walked.remaining };
     }
 
+    pub const Chunk = struct {
+        bytes: []const u8,
+        start: u32,
+    };
+
+    /// The run of bytes holding the byte at `pos`, read in place. A chunk's
+    /// gap splits it in two, so this is either half of one, never a character
+    /// cut in two.
+    pub fn chunkAt(self: *const Text, pos: u32) Chunk {
+        std.debug.assert(pos < self.len());
+
+        var node = self.root;
+        var left = pos;
+        while (node.level > 0) {
+            var child: u16 = 0;
+            while (left >= node.counts[child]) : (child += 1) left -= node.counts[child];
+            node = node.children[child];
+        }
+
+        const start = pos - left;
+        if (left < node.gap_start) return .{ .bytes = node.head(), .start = start };
+        return .{ .bytes = node.tail(), .start = start + node.gap_start };
+    }
+
     /// Copies the bytes in [from, to). Takes a const pointer on purpose:
     /// reading must not move a gap or the cached chunk, or every render would
     /// cost the next edit its head start.
@@ -734,4 +758,71 @@ test "reading does not move the cached chunk" {
     defer gpa.free(far);
 
     try testing.expectEqual(at_the_end, text.cursor_leaf_pos);
+}
+
+test "chunks read the whole text in both directions" {
+    const gpa = testing.allocator;
+
+    var text = try Text.init(gpa);
+    defer text.deinit();
+
+    var prng: std.Random.DefaultPrng = .init(5);
+    const random = prng.random();
+
+    // Edits all over the place leave gaps parked in the middle of chunks.
+    for (0..3000) |_| {
+        const length = text.len();
+        if (length > 2000 and random.boolean()) {
+            const out = try text.toBytes(gpa);
+            defer gpa.free(out);
+            var pos = random.uintAtMost(u32, length - 1);
+            while (out[pos] & 0xc0 == 0x80) pos -= 1;
+            var end = pos + 1;
+            while (end < length and out[end] & 0xc0 == 0x80) end += 1;
+            text.delete(pos, end - pos);
+        } else {
+            const word = ([_][]const u8{ "ab", "é", "→", "lorem ", "👩🏽‍🚀" })[random.uintLessThan(usize, 5)];
+            const out = try text.toBytes(gpa);
+            defer gpa.free(out);
+            var pos = if (length == 0) 0 else random.uintAtMost(u32, length);
+            while (pos < length and out[pos] & 0xc0 == 0x80) pos -= 1;
+            try text.insert(pos, word);
+        }
+    }
+
+    const model = try text.toBytes(gpa);
+    defer gpa.free(model);
+
+    var forward: std.ArrayList(u8) = .empty;
+    defer forward.deinit(gpa);
+    var pos: u32 = 0;
+    while (pos < text.len()) {
+        const piece = text.chunkAt(pos);
+        try testing.expectEqual(pos, piece.start);
+        try testing.expect(piece.bytes.len > 0);
+        try forward.appendSlice(gpa, piece.bytes);
+        pos += @intCast(piece.bytes.len);
+    }
+    try testing.expectEqualStrings(model, forward.items);
+
+    var end = text.len();
+    while (end > 0) {
+        const piece = text.chunkAt(end - 1);
+        try testing.expectEqual(end, piece.start + piece.bytes.len);
+        try testing.expectEqualStrings(model[piece.start..end], piece.bytes);
+        try testing.expect(std.unicode.utf8ValidateSlice(piece.bytes));
+        end = piece.start;
+    }
+}
+
+test "a chunk in the middle covers the byte asked for" {
+    var text = try Text.init(testing.allocator);
+    defer text.deinit();
+
+    try text.insert(0, "hello world");
+    try text.insert(5, ",");
+
+    const piece = text.chunkAt(7);
+    try testing.expect(piece.start <= 7 and 7 < piece.start + piece.bytes.len);
+    try testing.expectEqual(@as(u8, 'w'), piece.bytes[7 - piece.start]);
 }
