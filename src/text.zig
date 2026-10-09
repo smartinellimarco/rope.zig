@@ -3,16 +3,16 @@ const std = @import("std");
 const fanout = 16;
 const chunk = 256;
 
-/// A rope over UTF-8 chunks. Positions are character offsets, so every node
-/// counts both characters and bytes: edits land in logarithmic time no matter
-/// how far apart they are, and the text comes back out without re-encoding.
+/// A rope over UTF-8 chunks. Positions are byte offsets and every node counts
+/// the bytes under it: edits land in logarithmic time no matter how far apart
+/// they are, and the text comes back out without re-encoding.
 pub const Text = struct {
     gpa: std.mem.Allocator,
     // Chunks come from an arena and go away together.
     arena: std.heap.ArenaAllocator,
     root: *Node,
     // The chunk the last edit landed in, and the position of its first
-    // character. Edits cluster, so the next one usually falls inside it and
+    // byte. Edits cluster, so the next one usually falls inside it and
     // skips the descent.
     cursor_leaf: ?*Node = null,
     cursor_leaf_pos: u32 = 0,
@@ -30,7 +30,7 @@ pub const Text = struct {
     }
 
     pub fn len(self: Text) u32 {
-        return self.root.total().chars;
+        return self.root.total();
     }
 
     pub fn insert(self: *Text, pos: u32, text: []const u8) !void {
@@ -61,11 +61,8 @@ pub const Text = struct {
             @memcpy(leaf.text[leaf.gap_start..][0..take], rest[0..take]);
             leaf.gap_start += @intCast(take);
 
-            const added = charsIn(rest[0..take]);
             leaf.bytes += @intCast(take);
-            leaf.chars += @intCast(added);
-
-            self.fixCounts(leaf, added, @intCast(take));
+            self.fixCounts(leaf, take);
 
             offset += take;
             rest = rest[take..];
@@ -81,16 +78,14 @@ pub const Text = struct {
         while (remaining > 0) {
             leaf.moveGap(@intCast(offset));
             const after = leaf.tail();
-            const take = bytesOf(after, remaining);
+            const take: u32 = @intCast(@min(after.len, remaining));
 
             if (take > 0) {
-                const removed = charsIn(after[0..take]);
                 leaf.gap_end += @intCast(take);
                 leaf.bytes -= @intCast(take);
-                leaf.chars -= @intCast(removed);
 
-                self.fixCounts(leaf, -@as(i64, removed), -@as(i64, take));
-                remaining -= removed;
+                self.fixCounts(leaf, -@as(i64, take));
+                remaining -= take;
             }
 
             if (remaining == 0) break;
@@ -102,7 +97,7 @@ pub const Text = struct {
     pub fn toBytes(self: Text, gpa: std.mem.Allocator) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
-        try out.ensureTotalCapacity(gpa, self.root.total().bytes);
+        try out.ensureTotalCapacity(gpa, self.root.total());
 
         var leaf: ?*Node = firstLeaf(self.root);
         while (leaf) |node| : (leaf = nextLeaf(node)) {
@@ -128,14 +123,14 @@ pub const Text = struct {
             var walk = leaf;
             var walk_base = self.cursor_leaf_pos;
             while (true) {
-                if (pos >= walk_base and pos - walk_base <= walk.total().chars) {
+                if (pos >= walk_base and pos - walk_base <= walk.total()) {
                     node = walk;
                     base = walk_base;
                     break;
                 }
 
                 const parent = walk.parent orelse break;
-                for (parent.counts[0..walk.parent_idx]) |child| walk_base -= child.chars;
+                for (parent.counts[0..walk.parent_idx]) |child| walk_base -= child;
                 walk = parent;
             }
         }
@@ -145,10 +140,11 @@ pub const Text = struct {
         self.cursor_leaf = walked.leaf;
         self.cursor_leaf_pos = pos - walked.remaining;
 
-        return .{ .leaf = walked.leaf, .offset = offsetIn(walked.leaf, walked.remaining) };
+        std.debug.assert(walked.leaf.isBoundary(walked.remaining));
+        return .{ .leaf = walked.leaf, .offset = walked.remaining };
     }
 
-    /// Copies the characters in [from, to). Takes a const pointer on purpose:
+    /// Copies the bytes in [from, to). Takes a const pointer on purpose:
     /// reading must not move a gap or the cached chunk, or every render would
     /// cost the next edit its head start.
     pub fn slice(self: *const Text, gpa: std.mem.Allocator, from: u32, to: u32) ![]u8 {
@@ -157,7 +153,8 @@ pub const Text = struct {
         try out.ensureTotalCapacity(gpa, to - from);
 
         const walked = descend(self.root, from);
-        var skip = offsetIn(walked.leaf, walked.remaining);
+        std.debug.assert(walked.leaf.isBoundary(walked.remaining));
+        var skip = walked.remaining;
         var remaining = to - from;
 
         var leaf: ?*Node = walked.leaf;
@@ -174,9 +171,9 @@ pub const Text = struct {
                 const rest = piece[skip..];
                 skip = 0;
 
-                const take = bytesOf(rest, remaining);
+                const take: u32 = @intCast(@min(rest.len, remaining));
                 out.appendSliceAssumeCapacity(rest[0..take]);
-                remaining -= charsIn(rest[0..take]);
+                remaining -= take;
                 if (remaining == 0) break;
             }
         }
@@ -184,16 +181,13 @@ pub const Text = struct {
         return out.toOwnedSlice(gpa);
     }
 
-    fn fixCounts(self: *Text, leaf: *Node, chars: i64, bytes: i64) void {
+    fn fixCounts(self: *Text, leaf: *Node, bytes: i64) void {
         _ = self;
         var node = leaf;
         while (node.parent) |parent| {
             const slot = &parent.counts[node.parent_idx];
-            slot.chars = @intCast(@as(i64, slot.chars) + chars);
-            slot.bytes = @intCast(@as(i64, slot.bytes) + bytes);
-
-            parent.subtree.chars = @intCast(@as(i64, parent.subtree.chars) + chars);
-            parent.subtree.bytes = @intCast(@as(i64, parent.subtree.bytes) + bytes);
+            slot.* = @intCast(@as(i64, slot.*) + bytes);
+            parent.subtree = @intCast(@as(i64, parent.subtree) + bytes);
 
             node = parent;
         }
@@ -207,15 +201,12 @@ pub const Text = struct {
         const moved: u16 = @intCast(leaf.tail().len);
 
         @memcpy(sibling.text[0..moved], leaf.tail());
-        const moved_chars = charsIn(sibling.text[0..moved]);
         sibling.bytes = moved;
-        sibling.chars = @intCast(moved_chars);
         sibling.gap_start = moved;
         sibling.gap_end = chunk;
 
         leaf.gap_end = chunk;
         leaf.bytes -= moved;
-        leaf.chars -= @intCast(moved_chars);
 
         // Only this leaf's own entry moves: the text stayed in the subtree.
         if (leaf.parent) |parent| {
@@ -287,32 +278,19 @@ pub const Text = struct {
     }
 };
 
-const Counts = struct {
-    chars: u32 = 0,
-    bytes: u32 = 0,
-
-    fn add(self: *Counts, other: Counts) void {
-        self.chars += other.chars;
-        self.bytes += other.bytes;
-    }
-};
-
 const Node = struct {
     parent: ?*Node = null,
     parent_idx: u16 = 0,
     level: u8,
     len: u16 = 0,
     bytes: u16 = 0,
-    // Kept so a position never has to be counted out byte by byte, and so
-    // plain ascii chunks can map positions straight to offsets.
-    chars: u16 = 0,
     // Free space inside the chunk, parked where the last edit landed so that
     // typing forwards never moves anything.
     gap_start: u16 = 0,
     gap_end: u16 = chunk,
-    counts: [fanout]Counts = @splat(.{}),
+    counts: [fanout]u32 = @splat(0),
     // What the whole subtree holds, so climbing out of a chunk costs nothing.
-    subtree: Counts = .{},
+    subtree: u32 = 0,
     text: [chunk]u8 = undefined,
     children: [fanout]*Node = undefined,
 
@@ -338,33 +316,22 @@ const Node = struct {
         return self.text[self.gap_end..];
     }
 
-    fn total(self: Node) Counts {
-        return if (self.level == 0) .{ .chars = self.chars, .bytes = self.bytes } else self.subtree;
+    fn total(self: Node) u32 {
+        return if (self.level == 0) self.bytes else self.subtree;
     }
 
     fn recount(self: *Node) void {
-        self.subtree = .{};
-        for (self.counts[0..self.len]) |child| self.subtree.add(child);
+        self.subtree = 0;
+        for (self.counts[0..self.len]) |child| self.subtree += child;
+    }
+
+    // Chunks never split a character, so the end of one is always a boundary.
+    fn isBoundary(self: *Node, offset: u32) bool {
+        if (offset == self.bytes) return true;
+        const at = if (offset < self.gap_start) offset else offset + self.gap_end - self.gap_start;
+        return self.text[at] & 0xc0 != 0x80;
     }
 };
-
-fn charsIn(text: []const u8) u32 {
-    var count: u32 = 0;
-    for (text) |byte| count += @intFromBool(byte & 0xc0 != 0x80);
-    return count;
-}
-
-/// Byte offset of the character at `count`.
-fn bytesOf(text: []const u8, count: u32) u32 {
-    var seen: u32 = 0;
-    var at: u32 = 0;
-    while (at < text.len) : (at += 1) {
-        if (text[at] & 0xc0 == 0x80) continue;
-        if (seen == count) return at;
-        seen += 1;
-    }
-    return @intCast(text.len);
-}
 
 /// How many bytes of `text` fit in `room` without splitting a character.
 fn fitting(text: []const u8, room: u32) u32 {
@@ -381,23 +348,13 @@ fn descend(from: *Node, remaining: u32) struct { leaf: *Node, remaining: u32 } {
 
     while (node.level > 0) {
         var child: u16 = 0;
-        while (child + 1 < node.len and left > node.counts[child].chars) : (child += 1) {
-            left -= node.counts[child].chars;
+        while (child + 1 < node.len and left > node.counts[child]) : (child += 1) {
+            left -= node.counts[child];
         }
         node = node.children[child];
     }
 
     return .{ .leaf = node, .remaining = left };
-}
-
-/// Byte offset of the character at `remaining` inside a chunk, gap included.
-fn offsetIn(leaf: *Node, remaining: u32) u32 {
-    // An ascii chunk needs no counting: the offset is the position.
-    if (leaf.chars == leaf.bytes) return remaining;
-
-    const in_head = charsIn(leaf.head());
-    if (remaining <= in_head) return bytesOf(leaf.head(), remaining);
-    return @as(u32, leaf.gap_start) + bytesOf(leaf.tail(), remaining - in_head);
 }
 
 fn firstLeaf(node: *Node) *Node {
@@ -421,14 +378,13 @@ fn newNode(gpa: std.mem.Allocator, level: u8) !*Node {
     return node;
 }
 
-fn checkNode(node: *Node) !Counts {
+fn checkNode(node: *Node) !u32 {
     if (node.level == 0) {
-        try std.testing.expectEqual(@as(u32, node.chars), charsIn(node.head()) + charsIn(node.tail()));
         try std.testing.expectEqual(@as(u32, node.bytes), @as(u32, @intCast(node.head().len + node.tail().len)));
-        return .{ .chars = node.chars, .bytes = node.bytes };
+        return node.bytes;
     }
 
-    var sum: Counts = .{};
+    var sum: u32 = 0;
     try std.testing.expectEqual(node.subtree, node.total());
     for (node.children[0..node.len], 0..) |child, i| {
         try std.testing.expectEqual(@as(u16, @intCast(i)), child.parent_idx);
@@ -436,7 +392,7 @@ fn checkNode(node: *Node) !Counts {
 
         const actual = try checkNode(child);
         try std.testing.expectEqual(node.counts[i], actual);
-        sum.add(actual);
+        sum += actual;
     }
     return sum;
 }
@@ -482,13 +438,13 @@ test "edits near and far from each other" {
     try text.insert(0, "hola");
     try text.insert(4, " q");
     try text.insert(0, "¿");
-    text.delete(5, 2);
+    text.delete(6, 2);
 
     const out = try text.toBytes(testing.allocator);
     defer testing.allocator.free(out);
 
     try testing.expectEqualStrings("¿hola", out);
-    try testing.expectEqual(@as(u32, 5), text.len());
+    try testing.expectEqual(@as(u32, 6), text.len());
 }
 
 test "grows past a chunk without losing either side" {
@@ -516,13 +472,13 @@ test "multi byte characters are never split" {
     var i: u32 = 0;
     while (i < 400) : (i += 1) try text.insert(text.len(), "áé→");
 
-    try testing.expectEqual(@as(u32, 1200), text.len());
+    try testing.expectEqual(@as(u32, 2800), text.len());
 
     const out = try text.toBytes(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqual(@as(usize, 1200), try std.unicode.utf8CountCodepoints(out));
 
-    text.delete(1, 1198);
+    text.delete(2, 2795);
 
     const trimmed = try text.toBytes(testing.allocator);
     defer testing.allocator.free(trimmed);
@@ -585,12 +541,12 @@ test "a character too wide for what is left starts a new chunk" {
     const filler: [chunk - 2]u8 = @splat('a');
     try text.insert(0, &filler);
     try text.insert(chunk - 2, "→");
-    try text.insert(chunk - 1, "→");
+    try text.insert(chunk + 1, "→");
 
     const out = try text.toBytes(testing.allocator);
     defer testing.allocator.free(out);
 
-    try testing.expectEqual(@as(u32, chunk), text.len());
+    try testing.expectEqual(@as(u32, chunk + 4), text.len());
     try testing.expectEqualStrings("a→→", out[chunk - 3 ..]);
 }
 
@@ -632,7 +588,7 @@ fn cursorBase(leaf: *Node) u32 {
     var node = leaf;
     var base: u32 = 0;
     while (node.parent) |parent| {
-        for (parent.counts[0..node.parent_idx]) |child| base += child.chars;
+        for (parent.counts[0..node.parent_idx]) |child| base += child;
         node = parent;
     }
     return base;
@@ -706,7 +662,7 @@ test "a jump backwards lands where a plain descent would" {
     }
 }
 
-test "a slice reads back a range of characters" {
+test "a slice reads back a range of bytes" {
     const gpa = testing.allocator;
 
     var text = try Text.init(gpa);
@@ -733,11 +689,11 @@ test "a slice cuts between characters, never inside one" {
     defer text.deinit();
     try text.insert(0, "áéíóú→");
 
-    const cut = try text.slice(gpa, 2, 5);
+    const cut = try text.slice(gpa, 4, 10);
     defer gpa.free(cut);
     try testing.expectEqualStrings("íóú", cut);
 
-    const arrow = try text.slice(gpa, 5, 6);
+    const arrow = try text.slice(gpa, 10, 13);
     defer gpa.free(arrow);
     try testing.expectEqualStrings("→", arrow);
 }

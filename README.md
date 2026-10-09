@@ -1,8 +1,8 @@
 # rope.zig
 
-A rope over utf-8 chunks. Positions are characters, every node counts both
-characters and bytes, and each chunk keeps a gap where the last edit landed so
-typing forwards moves nothing.
+A rope over utf-8 chunks. Positions are bytes, every node counts the bytes under
+it, and each chunk keeps a gap where the last edit landed so typing forwards
+moves nothing.
 
 ## Install
 
@@ -34,9 +34,9 @@ const part = try text.slice(gpa, 6, 11);   // "there"
 defer gpa.free(part);
 ```
 
-Positions are character offsets, so `delete(5, 6)` erases six characters, not
-six bytes. Reading never moves a gap: `slice` takes a const pointer and leaves
-the chunk the last edit touched where it was.
+Positions are byte offsets, so `delete(5, 6)` erases six bytes. Reading never
+moves a gap: `slice` takes a const pointer and leaves the chunk the last edit
+touched where it was.
 
 ## Test
 
