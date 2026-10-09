@@ -37,8 +37,8 @@ const piece = text.chunkAt(7);   // the bytes around position 7, no copy
 ```
 
 Positions are byte offsets, so `delete(5, 6)` erases six bytes. Reading never
-moves a gap: `slice` and `chunkAt` take a const pointer and leaves the chunk the last edit
-touched where it was.
+moves a gap: `slice` and `chunkAt` take a const pointer and leave the chunk the
+last edit touched where it was.
 
 ## Test
 
